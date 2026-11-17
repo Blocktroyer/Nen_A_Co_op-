@@ -39,6 +39,13 @@ public class Nen : ModuleRules
 			"Nen/Variant_SideScrolling/Interfaces",
 			"Nen/Variant_SideScrolling/UI"
 		});
+		
+		PublicDependencyModuleNames.AddRange(new string[]
+		{
+			"HTTP",
+			"Json",
+			"JsonUtilities"
+		});
 
 		// Uncomment if you are using Slate UI
 		// PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });
