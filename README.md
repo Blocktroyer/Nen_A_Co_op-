@@ -6,16 +6,16 @@ A co-op game for long-distance couples, played on your own time. Unreal Engine 5
 
 Type these in the in-game console (`` ` `` key) while playing. Each command runs as the player signed in to that window, and signs in automatically if needed. Results show on screen and in the log under `LogNenBackend`. The commands are left out of Shipping builds.
 
-| Command | What it does | Example |
+| Command | What it does |
 |---|---|---|
-| `nen.CreateCouple` | Starts a couple and prints its invite code. If you already have a couple, prints its existing code instead | `nen.CreateCouple` |
-| `nen.InviteCode` | Prints your couple's invite code, if your partner hasn't joined yet | `nen.InviteCode` |
-| `nen.Join <code>` | Joins your partner's couple with their invite code | `nen.Join A1B2C3` |
-| `nen.Pigeon <message>` | Sends your partner a letter (spaces are fine) | `nen.Pigeon miss you already` |
-| `nen.Storm <LevelId> [amount]` | Raises the stream in that level on your partner's side (amount defaults to 1) | `nen.Storm Ravine 1` |
-| `nen.Sync` | Applies your partner's world events, prints every stream flow, then shows new letters and marks them read | `nen.Sync` |
-| `nen.Status` | Shows which player this window is signed in as, and its world state | `nen.Status` |
-| `nen.ResetLogin` | Forgets this window's saved login; the next command signs in as a new player | `nen.ResetLogin` |
+| `nen.CreateCouple` | Starts a couple and prints its invite code. If you already have a couple, prints its existing code instead
+| `nen.InviteCode` | Prints your couple's invite code, if your partner hasn't joined yet
+| `nen.Join <code>` | Joins your partner's couple with their invite code
+| `nen.Pigeon <message>` | Sends your partner a letter (spaces are fine)
+| `nen.Storm <LevelId> [amount]` | Raises the stream in that level on your partner's side (amount defaults to 1)
+| `nen.Sync` | Applies your partner's world events, prints every stream flow, then shows new letters and marks them read
+| `nen.Status` | Shows which player this window is signed in as, and its world state
+| `nen.ResetLogin` | Forgets this window's saved login; the next command signs in as a new player
 
 ### Testing two players
 
