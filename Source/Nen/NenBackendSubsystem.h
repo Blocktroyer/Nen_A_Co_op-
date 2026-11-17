@@ -44,6 +44,20 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Nen|Backend")
 	void LoginBP(FOnNenBackendDone OnDone);
 
+	// Logs in only if needed; callers that arrive while a login is running share it
+	void EnsureLoggedIn(TFunction<void(bool)> Done);
+
+	// Forget the saved login, e.g. after deleting test users in the Supabase dashboard
+	UFUNCTION(BlueprintCallable, Category = "Nen|Backend")
+	void ResetLogin();
+
+	// Save slot holding this window's login: "NenAuth", "NenAuth_PIE1", "NenAuth_B"...
+	FString GetAuthSlot() const { return AuthSlot; }
+
+	// Reads this player's couple. InviteCode is set while waiting for the partner,
+	// and empty once they've joined (join_couple clears it).
+	void FetchCouple(TFunction<void(bool bOk, bool bHasCouple, const FString& InviteCode, bool bPartnerJoined)> Done);
+
 	UFUNCTION(BlueprintPure, Category = "Nen|Backend") FString GetUserId() const { return UserId; }
 	UFUNCTION(BlueprintPure, Category = "Nen|Backend") bool IsLoggedIn() const { return !AccessToken.IsEmpty(); }
 
@@ -81,6 +95,9 @@ private:
 	FString AccessToken;
 	FString RefreshToken;
 	FString UserId;
+
+	FString AuthSlot = TEXT("NenAuth");
+	TArray<TFunction<void(bool)>> LoginWaiters;
 
 	void Send(const FString& Verb, const FString& Url, const FString& Body, bool bWithUser,
 			  TFunction<void(bool, const FString&)> Done);

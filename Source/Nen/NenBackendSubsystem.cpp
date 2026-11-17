@@ -6,13 +6,43 @@
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "JsonObjectConverter.h"
+#include "Engine/Engine.h"
+#include "Engine/GameInstance.h"
+#include "Engine/World.h"
+#include "HAL/IConsoleManager.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
 
-static const FString NenAuthSlot = TEXT("NenAuth");
+DEFINE_LOG_CATEGORY_STATIC(LogNenBackend, Log, All);
 
 void UNenBackendSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     Super::Initialize(Collection);
-    if (UNenAuthSave* Save = Cast<UNenAuthSave>(UGameplayStatics::LoadGameFromSlot(NenAuthSlot, 0)))
+
+    // Each test window needs its own login, or they'd all be the same player.
+    //   Standalone / packaged:  launch with -NenProfile=B   -> slot "NenAuth_B"
+    //   Play In Editor:         2nd window, 3rd window...   -> slot "NenAuth_PIE1", "NenAuth_PIE2"
+    FString Profile;
+    if (FParse::Value(FCommandLine::Get(), TEXT("NenProfile="), Profile) && !Profile.IsEmpty())
+    {
+        AuthSlot = TEXT("NenAuth_") + Profile;
+    }
+#if WITH_EDITOR
+    else if (const FWorldContext* Context = GetGameInstance()->GetWorldContext();
+             Context && Context->WorldType == EWorldType::PIE && Context->PIEInstance > 0)
+    {
+        AuthSlot = FString::Printf(TEXT("NenAuth_PIE%d"), Context->PIEInstance);
+    }
+#endif
+    UE_LOG(LogNenBackend, Log, TEXT("Backend using login slot %s"), *AuthSlot);
+
+    ProjectUrl.RemoveFromEnd(TEXT("/"));
+    if (PublishableKey.IsEmpty())
+    {
+        UE_LOG(LogNenBackend, Error, TEXT("PublishableKey is empty in Config/DefaultGame.ini"));
+    }
+
+    if (UNenAuthSave* Save = Cast<UNenAuthSave>(UGameplayStatics::LoadGameFromSlot(AuthSlot, 0)))
     {
         RefreshToken = Save->RefreshToken;
         UserId = Save->UserId;
@@ -44,9 +74,67 @@ void UNenBackendSubsystem::HandleAuthResponse(bool bOk, const FString& Json, TFu
             UGameplayStatics::CreateSaveGameObject(UNenAuthSave::StaticClass()));
         Save->RefreshToken = RefreshToken;
         Save->UserId = UserId;
-        UGameplayStatics::SaveGameToSlot(Save, NenAuthSlot, 0);
+        UGameplayStatics::SaveGameToSlot(Save, AuthSlot, 0);
     }
     Done(bOk && !AccessToken.IsEmpty());
+}
+
+void UNenBackendSubsystem::EnsureLoggedIn(TFunction<void(bool)> Done)
+{
+    if (IsLoggedIn())
+    {
+        Done(true);
+        return;
+    }
+    // Refresh tokens rotate, so two refreshes at once would knock each other out: share one.
+    LoginWaiters.Add(MoveTemp(Done));
+    if (LoginWaiters.Num() == 1)
+    {
+        Login([this](bool bOk)
+        {
+            TArray<TFunction<void(bool)>> Waiters = MoveTemp(LoginWaiters);
+            LoginWaiters.Reset();
+            for (TFunction<void(bool)>& Waiter : Waiters)
+            {
+                Waiter(bOk);
+            }
+        });
+    }
+}
+
+void UNenBackendSubsystem::FetchCouple(
+    TFunction<void(bool bOk, bool bHasCouple, const FString& InviteCode, bool bPartnerJoined)> Done)
+{
+    // Row-level security only returns the couple this player belongs to
+    Rest(TEXT("GET"), TEXT("couples?select=invite_code,player_b"), FString(),
+        [Done](bool bOk, const FString& Json)
+        {
+            TArray<TSharedPtr<FJsonValue>> Rows;
+            if (!bOk || !FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), Rows))
+            {
+                Done(false, false, FString(), false);
+                return;
+            }
+            const TSharedPtr<FJsonObject> Row = Rows.Num() > 0 ? Rows[0]->AsObject() : nullptr;
+            if (!Row.IsValid())
+            {
+                Done(true, false, FString(), false);
+                return;
+            }
+            FString InviteCode, PartnerId;
+            Row->TryGetStringField(TEXT("invite_code"), InviteCode);                 // null once used
+            const bool bPartnerJoined = Row->TryGetStringField(TEXT("player_b"), PartnerId);
+            Done(true, true, InviteCode, bPartnerJoined);
+        });
+}
+
+void UNenBackendSubsystem::ResetLogin()
+{
+    AccessToken.Reset();
+    RefreshToken.Reset();
+    UserId.Reset();
+    World = FNenWorldState();
+    UGameplayStatics::DeleteGameInSlot(AuthSlot, 0);
 }
 
 void UNenBackendSubsystem::Send(const FString& Verb, const FString& Url, const FString& Body,
@@ -218,3 +306,345 @@ void UNenBackendSubsystem::SyncWorldBP(FOnNenBackendDone OnDone)
 {
     SyncWorld([OnDone](bool bOk) { OnDone.ExecuteIfBound(bOk); });
 }
+
+// ---------------------------------------------------------------- test console commands
+// Type these in the in-game console (` key). Each runs as the player signed in to that window.
+
+#if !UE_BUILD_SHIPPING
+namespace NenConsole
+{
+    static void Print(const FString& Message, bool bError = false)
+    {
+        if (bError)
+        {
+            UE_LOG(LogNenBackend, Warning, TEXT("%s"), *Message);
+        }
+        else
+        {
+            UE_LOG(LogNenBackend, Log, TEXT("%s"), *Message);
+        }
+        if (GEngine)
+        {
+            GEngine->AddOnScreenDebugMessage(-1, 10.f, bError ? FColor::Red : FColor::Cyan, Message);
+        }
+    }
+
+    // Pulls the "message" out of a Supabase error body
+    static FString ErrorText(const FString& Json)
+    {
+        TSharedPtr<FJsonObject> Obj;
+        FString Message;
+        if (FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), Obj) && Obj.IsValid()
+            && Obj->TryGetStringField(TEXT("message"), Message))
+        {
+            return Message;
+        }
+        return Json.IsEmpty() ? TEXT("no response (check ProjectUrl / network)") : Json;
+    }
+
+    static FString ToJson(const TSharedRef<FJsonObject>& Obj)
+    {
+        FString Out;
+        FJsonSerializer::Serialize(Obj, TJsonWriterFactory<>::Create(&Out));
+        return Out;
+    }
+
+    // Finds this window's backend, logs in if needed, then runs Fn
+    static void WithBackend(UWorld* World, TFunction<void(UNenBackendSubsystem*)> Fn)
+    {
+        UGameInstance* GameInstance = World ? World->GetGameInstance() : nullptr;
+        UNenBackendSubsystem* Backend = GameInstance ? GameInstance->GetSubsystem<UNenBackendSubsystem>() : nullptr;
+        if (!Backend)
+        {
+            Print(TEXT("Nen backend not available (run this while playing)"), true);
+            return;
+        }
+        TWeakObjectPtr<UNenBackendSubsystem> Weak(Backend);
+        Backend->EnsureLoggedIn([Weak, Fn](bool bOk)
+        {
+            if (!Weak.IsValid())
+            {
+                return;
+            }
+            if (!bOk)
+            {
+                Print(TEXT("Login failed. If you deleted test users in Supabase, run nen.ResetLogin"), true);
+                return;
+            }
+            Fn(Weak.Get());
+        });
+    }
+
+    static void ReportRpc(bool bOk, const FString& Json, const FString& Success)
+    {
+        if (bOk)
+        {
+            Print(Success);
+        }
+        else
+        {
+            Print(TEXT("Failed: ") + ErrorText(Json), true);
+        }
+    }
+
+    static void PrintWorld(const FNenWorldState& World)
+    {
+        if (World.Levels.Num() == 0 && World.Checkpoints.Num() == 0)
+        {
+            Print(TEXT("World: nothing has changed yet"));
+        }
+        for (const TPair<FString, FNenLevelState>& Level : World.Levels)
+        {
+            Print(FString::Printf(TEXT("World: %s stream flow = %.2f"), *Level.Key, Level.Value.StreamFlow));
+        }
+        for (const TPair<FString, FNenCheckpointState>& Checkpoint : World.Checkpoints)
+        {
+            Print(FString::Printf(TEXT("World: checkpoint %s %s (by %s)"), *Checkpoint.Key,
+                                  Checkpoint.Value.Unlocked ? TEXT("unlocked") : TEXT("locked"),
+                                  *Checkpoint.Value.By));
+        }
+    }
+
+    // Prints unread letters, then marks them read
+    static void CollectMail(UNenBackendSubsystem* Backend)
+    {
+        TWeakObjectPtr<UNenBackendSubsystem> Weak(Backend);
+        Backend->Rest(TEXT("GET"),
+            TEXT("mailbox?recipient=eq.") + Backend->GetUserId() + TEXT("&collected_at=is.null&order=deliver_at"),
+            FString(),
+            [Weak](bool bOk, const FString& Json)
+            {
+                TArray<TSharedPtr<FJsonValue>> Letters;
+                if (!bOk || !FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), Letters))
+                {
+                    Print(TEXT("Mail fetch failed: ") + ErrorText(Json), true);
+                    return;
+                }
+                if (Letters.Num() == 0)
+                {
+                    Print(TEXT("Mail: no new letters"));
+                    return;
+                }
+                TArray<TSharedPtr<FJsonValue>> Ids;
+                for (const TSharedPtr<FJsonValue>& Value : Letters)
+                {
+                    const TSharedPtr<FJsonObject> Letter = Value->AsObject();
+                    if (!Letter.IsValid())
+                    {
+                        continue;
+                    }
+                    FString Message, Id;
+                    Letter->TryGetStringField(TEXT("message"), Message);
+                    Letter->TryGetStringField(TEXT("id"), Id);
+                    FString Items;
+                    const TArray<TSharedPtr<FJsonValue>>* ItemArray = nullptr;
+                    if (Letter->TryGetArrayField(TEXT("items"), ItemArray))
+                    {
+                        for (const TSharedPtr<FJsonValue>& Item : *ItemArray)
+                        {
+                            Items += (Items.IsEmpty() ? TEXT("") : TEXT(", ")) + Item->AsString();
+                        }
+                    }
+                    Print(FString::Printf(TEXT("Mail: \"%s\"%s"), *Message,
+                                          Items.IsEmpty() ? TEXT("") : *(TEXT("  + ") + Items)));
+                    Ids.Add(MakeShared<FJsonValueString>(Id));
+                }
+                if (Weak.IsValid())
+                {
+                    TSharedRef<FJsonObject> Body = MakeShared<FJsonObject>();
+                    Body->SetArrayField(TEXT("p_ids"), Ids);
+                    Weak->CallRpc(TEXT("mark_mail_collected"), ToJson(Body), [](bool, const FString&) {});
+                }
+            });
+    }
+
+    static void PrintInviteCode(const FString& Code)
+    {
+        Print(FString::Printf(TEXT("Invite code: %s   (in the other window: nen.Join %s)"), *Code, *Code));
+    }
+
+    // Prints the existing couple's invite code, or why there isn't one
+    static void PrintCouple(UNenBackendSubsystem* Backend)
+    {
+        Backend->FetchCouple([](bool bOk, bool bHasCouple, const FString& InviteCode, bool bPartnerJoined)
+        {
+            if (!bOk)
+            {
+                Print(TEXT("Couldn't read your couple"), true);
+            }
+            else if (!bHasCouple)
+            {
+                Print(TEXT("No couple yet. Run nen.CreateCouple, or nen.Join <code>"));
+            }
+            else if (bPartnerJoined)
+            {
+                Print(TEXT("Already paired: your partner has joined, so the invite code is used up"));
+            }
+            else
+            {
+                PrintInviteCode(InviteCode);
+            }
+        });
+    }
+
+    static FAutoConsoleCommandWithWorldAndArgs CreateCoupleCmd(
+        TEXT("nen.CreateCouple"),
+        TEXT("Start a couple and print its invite code (or the existing one). Usage: nen.CreateCouple"),
+        FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
+        {
+            WithBackend(World, [](UNenBackendSubsystem* Backend)
+            {
+                TWeakObjectPtr<UNenBackendSubsystem> Weak(Backend);
+                Backend->CallRpc(TEXT("create_couple"), TEXT("{}"), [Weak](bool bOk, const FString& Json)
+                {
+                    if (bOk)
+                    {
+                        PrintInviteCode(Json.TrimQuotes());
+                    }
+                    else if (ErrorText(Json).Contains(TEXT("already paired")) && Weak.IsValid())
+                    {
+                        PrintCouple(Weak.Get());   // already has a couple: show its code instead
+                    }
+                    else
+                    {
+                        Print(TEXT("CreateCouple failed: ") + ErrorText(Json), true);
+                    }
+                });
+            });
+        }));
+
+    static FAutoConsoleCommandWithWorldAndArgs InviteCodeCmd(
+        TEXT("nen.InviteCode"),
+        TEXT("Print your couple's invite code if it hasn't been used yet. Usage: nen.InviteCode"),
+        FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
+        {
+            WithBackend(World, [](UNenBackendSubsystem* Backend) { PrintCouple(Backend); });
+        }));
+
+    static FAutoConsoleCommandWithWorldAndArgs JoinCmd(
+        TEXT("nen.Join"),
+        TEXT("Join a couple with an invite code. Usage: nen.Join A1B2C3"),
+        FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+        {
+            if (Args.Num() < 1)
+            {
+                Print(TEXT("Usage: nen.Join <invite code>"), true);
+                return;
+            }
+            const FString Code = Args[0];
+            WithBackend(World, [Code](UNenBackendSubsystem* Backend)
+            {
+                TSharedRef<FJsonObject> Body = MakeShared<FJsonObject>();
+                Body->SetStringField(TEXT("p_code"), Code);
+                Backend->CallRpc(TEXT("join_couple"), ToJson(Body), [](bool bOk, const FString& Json)
+                {
+                    ReportRpc(bOk, Json, TEXT("Paired! You're now partners."));
+                });
+            });
+        }));
+
+    static FAutoConsoleCommandWithWorldAndArgs PigeonCmd(
+        TEXT("nen.Pigeon"),
+        TEXT("Send your partner a letter. Usage: nen.Pigeon miss you already"),
+        FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+        {
+            const FString Message = FString::Join(Args, TEXT(" "));
+            if (Message.IsEmpty())
+            {
+                Print(TEXT("Usage: nen.Pigeon <message>"), true);
+                return;
+            }
+            WithBackend(World, [Message](UNenBackendSubsystem* Backend)
+            {
+                TSharedRef<FJsonObject> Body = MakeShared<FJsonObject>();
+                Body->SetStringField(TEXT("p_message"), Message);
+                Body->SetArrayField(TEXT("p_items"), TArray<TSharedPtr<FJsonValue>>());
+                Backend->CallRpc(TEXT("send_pigeon"), ToJson(Body), [Message](bool bOk, const FString& Json)
+                {
+                    ReportRpc(bOk, Json, FString::Printf(TEXT("Pigeon sent: \"%s\""), *Message));
+                });
+            });
+        }));
+
+    static FAutoConsoleCommandWithWorldAndArgs StormCmd(
+        TEXT("nen.Storm"),
+        TEXT("Raise the stream in a level on your partner's side. Usage: nen.Storm Ravine 1"),
+        FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+        {
+            if (Args.Num() < 1)
+            {
+                Print(TEXT("Usage: nen.Storm <LevelId> [amount, default 1]"), true);
+                return;
+            }
+            const FString LevelId = Args[0];
+            const double Amount = Args.Num() > 1 ? FCString::Atod(*Args[1]) : 1.0;
+            WithBackend(World, [LevelId, Amount](UNenBackendSubsystem* Backend)
+            {
+                TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+                Payload->SetNumberField(TEXT("v"), 1);
+                Payload->SetNumberField(TEXT("delta_flow"), Amount);
+                Payload->SetStringField(TEXT("cause"), TEXT("storm"));
+
+                TSharedRef<FJsonObject> Body = MakeShared<FJsonObject>();
+                Body->SetStringField(TEXT("p_type"), TEXT("water_stream"));
+                Body->SetStringField(TEXT("p_target"), LevelId);
+                Body->SetObjectField(TEXT("p_payload"), Payload);
+                Backend->CallRpc(TEXT("send_world_event"), ToJson(Body),
+                    [LevelId, Amount](bool bOk, const FString& Json)
+                    {
+                        ReportRpc(bOk, Json, FString::Printf(TEXT("Storm sent: %s stream +%.2f"), *LevelId, Amount));
+                    });
+            });
+        }));
+
+    static FAutoConsoleCommandWithWorldAndArgs SyncCmd(
+        TEXT("nen.Sync"),
+        TEXT("Apply your partner's world events and read new letters. Usage: nen.Sync"),
+        FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
+        {
+            WithBackend(World, [](UNenBackendSubsystem* Backend)
+            {
+                TWeakObjectPtr<UNenBackendSubsystem> Weak(Backend);
+                Backend->SyncWorld([Weak](bool bOk)
+                {
+                    if (!Weak.IsValid())
+                    {
+                        return;
+                    }
+                    if (!bOk)
+                    {
+                        Print(TEXT("Sync failed (not paired yet, or the SQL isn't set up)"), true);
+                        return;
+                    }
+                    PrintWorld(Weak->World);
+                    CollectMail(Weak.Get());
+                });
+            });
+        }));
+
+    static FAutoConsoleCommandWithWorldAndArgs StatusCmd(
+        TEXT("nen.Status"),
+        TEXT("Show which player this window is signed in as. Usage: nen.Status"),
+        FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
+        {
+            WithBackend(World, [](UNenBackendSubsystem* Backend)
+            {
+                Print(FString::Printf(TEXT("Signed in as %s (slot %s)"), *Backend->GetUserId(), *Backend->GetAuthSlot()));
+                PrintWorld(Backend->World);
+            });
+        }));
+
+    static FAutoConsoleCommandWithWorldAndArgs ResetLoginCmd(
+        TEXT("nen.ResetLogin"),
+        TEXT("Forget this window's saved login; the next command signs in as a new player. Usage: nen.ResetLogin"),
+        FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
+        {
+            UGameInstance* GameInstance = World ? World->GetGameInstance() : nullptr;
+            if (UNenBackendSubsystem* Backend = GameInstance ? GameInstance->GetSubsystem<UNenBackendSubsystem>() : nullptr)
+            {
+                Backend->ResetLogin();
+                Print(TEXT("Login forgotten. The next nen.* command signs in as a new player."));
+            }
+        }));
+}
+#endif // !UE_BUILD_SHIPPING
