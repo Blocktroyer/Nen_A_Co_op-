@@ -10,6 +10,7 @@
 class USpringArmComponent;
 class UCameraComponent;
 class UInputAction;
+class UNenInteractableComponent;
 struct FInputActionValue;
 
 DECLARE_LOG_CATEGORY_EXTERN(LogTemplateCharacter, Log, All);
@@ -49,6 +50,10 @@ protected:
 	UPROPERTY(EditAnywhere, Category="Input")
 	UInputAction* MouseLookAction;
 
+	/** Interact Input Action (mailboxes and other UNenInteractableComponents) */
+	UPROPERTY(EditAnywhere, Category="Input")
+	UInputAction* InteractAction;
+
 public:
 
 	/** Constructor */
@@ -84,6 +89,14 @@ public:
 	/** Handles jump pressed inputs from either controls or UI interfaces */
 	UFUNCTION(BlueprintCallable, Category="Input")
 	virtual void DoJumpEnd();
+
+	/** Uses the nearest interactable the character is in range of */
+	UFUNCTION(BlueprintCallable, Category="Input")
+	virtual void DoInteract();
+
+	/** Nearest enabled interactable in range, or null. Use it to show the prompt. */
+	UFUNCTION(BlueprintPure, Category="Interaction")
+	UNenInteractableComponent* GetBestInteractable() const;
 
 public:
 

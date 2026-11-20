@@ -135,6 +135,141 @@ void UNenBackendSubsystem::ResetLogin()
     UserId.Reset();
     World = FNenWorldState();
     UGameplayStatics::DeleteGameInSlot(AuthSlot, 0);
+    if (Inbox.Num() > 0)
+    {
+        Inbox.Reset();
+        OnInboxChanged.Broadcast();
+    }
+}
+
+// ---------------------------------------------------------------- mail
+
+static FString JsonToString(const TSharedRef<FJsonObject>& Obj)
+{
+    FString Out;
+    FJsonSerializer::Serialize(Obj, TJsonWriterFactory<>::Create(&Out));
+    return Out;
+}
+
+static bool ParseLetter(const TSharedPtr<FJsonObject>& Row, FNenLetter& Out)
+{
+    if (!Row.IsValid() || !Row->TryGetStringField(TEXT("id"), Out.Id))
+    {
+        return false;
+    }
+    Row->TryGetStringField(TEXT("message"), Out.Message);
+    const TArray<TSharedPtr<FJsonValue>>* Items = nullptr;
+    if (Row->TryGetArrayField(TEXT("items"), Items))
+    {
+        for (const TSharedPtr<FJsonValue>& Item : *Items)
+        {
+            FString ItemName;
+            if (Item.IsValid() && Item->TryGetString(ItemName))
+            {
+                Out.Items.Add(ItemName);
+            }
+        }
+    }
+    FString SentAt;
+    if (Row->TryGetStringField(TEXT("sent_at"), SentAt))
+    {
+        // "2026-11-20T10:00:00.123456+00:00": keep the seconds-precision part (always UTC)
+        FDateTime::ParseIso8601(*SentAt.Left(19), Out.SentAt);
+    }
+    return true;
+}
+
+void UNenBackendSubsystem::FetchMail(TFunction<void(bool)> Done)
+{
+    EnsureLoggedIn([this, Done](bool bLoggedIn)
+    {
+        if (!bLoggedIn)
+        {
+            Done(false);
+            return;
+        }
+        Rest(TEXT("GET"),
+             TEXT("mailbox?select=id,message,items,sent_at&recipient=eq.") + UserId
+                 + TEXT("&collected_at=is.null&order=deliver_at"),
+             FString(),
+            [this, Done](bool bOk, const FString& Json)
+            {
+                TArray<TSharedPtr<FJsonValue>> Rows;
+                if (!bOk || !FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), Rows))
+                {
+                    Done(false);
+                    return;
+                }
+                Inbox.Reset();
+                for (const TSharedPtr<FJsonValue>& Value : Rows)
+                {
+                    FNenLetter Letter;
+                    if (Value.IsValid() && ParseLetter(Value->AsObject(), Letter))
+                    {
+                        Inbox.Add(MoveTemp(Letter));
+                    }
+                }
+                OnInboxChanged.Broadcast();
+                Done(true);
+            });
+    });
+}
+
+void UNenBackendSubsystem::FetchMailBP(FOnNenBackendDone OnDone)
+{
+    FetchMail([OnDone](bool bOk) { OnDone.ExecuteIfBound(bOk); });
+}
+
+void UNenBackendSubsystem::SendPigeon(const FString& Message, const TArray<FString>& Items,
+                                      TFunction<void(bool, const FString&)> Done)
+{
+    TSharedRef<FJsonObject> Body = MakeShared<FJsonObject>();
+    Body->SetStringField(TEXT("p_message"), Message);
+    TArray<TSharedPtr<FJsonValue>> ItemValues;
+    for (const FString& Item : Items)
+    {
+        ItemValues.Add(MakeShared<FJsonValueString>(Item));
+    }
+    Body->SetArrayField(TEXT("p_items"), ItemValues);
+    const FString BodyString = JsonToString(Body);
+
+    EnsureLoggedIn([this, BodyString, Done](bool bLoggedIn)
+    {
+        if (!bLoggedIn)
+        {
+            Done(false, FString());
+            return;
+        }
+        CallRpc(TEXT("send_pigeon"), BodyString, Done);
+    });
+}
+
+void UNenBackendSubsystem::SendPigeonBP(const FString& Message, const TArray<FString>& Items, FOnNenBackendDone OnDone)
+{
+    SendPigeon(Message, Items, [OnDone](bool bOk, const FString&) { OnDone.ExecuteIfBound(bOk); });
+}
+
+void UNenBackendSubsystem::MarkLettersRead(const TArray<FString>& LetterIds)
+{
+    if (LetterIds.Num() == 0)
+    {
+        return;
+    }
+    // Update locally straight away so mailbox flags drop without waiting for the server.
+    // If the request fails, the letters just come back on the next FetchMail.
+    if (Inbox.RemoveAll([&LetterIds](const FNenLetter& Letter) { return LetterIds.Contains(Letter.Id); }) > 0)
+    {
+        OnInboxChanged.Broadcast();
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Ids;
+    for (const FString& Id : LetterIds)
+    {
+        Ids.Add(MakeShared<FJsonValueString>(Id));
+    }
+    TSharedRef<FJsonObject> Body = MakeShared<FJsonObject>();
+    Body->SetArrayField(TEXT("p_ids"), Ids);
+    CallRpc(TEXT("mark_mail_collected"), JsonToString(Body), [](bool, const FString&) {});
 }
 
 void UNenBackendSubsystem::Send(const FString& Verb, const FString& Url, const FString& Body,
@@ -409,53 +544,32 @@ namespace NenConsole
     static void CollectMail(UNenBackendSubsystem* Backend)
     {
         TWeakObjectPtr<UNenBackendSubsystem> Weak(Backend);
-        Backend->Rest(TEXT("GET"),
-            TEXT("mailbox?recipient=eq.") + Backend->GetUserId() + TEXT("&collected_at=is.null&order=deliver_at"),
-            FString(),
-            [Weak](bool bOk, const FString& Json)
+        Backend->FetchMail([Weak](bool bOk)
+        {
+            if (!Weak.IsValid())
             {
-                TArray<TSharedPtr<FJsonValue>> Letters;
-                if (!bOk || !FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), Letters))
-                {
-                    Print(TEXT("Mail fetch failed: ") + ErrorText(Json), true);
-                    return;
-                }
-                if (Letters.Num() == 0)
-                {
-                    Print(TEXT("Mail: no new letters"));
-                    return;
-                }
-                TArray<TSharedPtr<FJsonValue>> Ids;
-                for (const TSharedPtr<FJsonValue>& Value : Letters)
-                {
-                    const TSharedPtr<FJsonObject> Letter = Value->AsObject();
-                    if (!Letter.IsValid())
-                    {
-                        continue;
-                    }
-                    FString Message, Id;
-                    Letter->TryGetStringField(TEXT("message"), Message);
-                    Letter->TryGetStringField(TEXT("id"), Id);
-                    FString Items;
-                    const TArray<TSharedPtr<FJsonValue>>* ItemArray = nullptr;
-                    if (Letter->TryGetArrayField(TEXT("items"), ItemArray))
-                    {
-                        for (const TSharedPtr<FJsonValue>& Item : *ItemArray)
-                        {
-                            Items += (Items.IsEmpty() ? TEXT("") : TEXT(", ")) + Item->AsString();
-                        }
-                    }
-                    Print(FString::Printf(TEXT("Mail: \"%s\"%s"), *Message,
-                                          Items.IsEmpty() ? TEXT("") : *(TEXT("  + ") + Items)));
-                    Ids.Add(MakeShared<FJsonValueString>(Id));
-                }
-                if (Weak.IsValid())
-                {
-                    TSharedRef<FJsonObject> Body = MakeShared<FJsonObject>();
-                    Body->SetArrayField(TEXT("p_ids"), Ids);
-                    Weak->CallRpc(TEXT("mark_mail_collected"), ToJson(Body), [](bool, const FString&) {});
-                }
-            });
+                return;
+            }
+            if (!bOk)
+            {
+                Print(TEXT("Mail fetch failed"), true);
+                return;
+            }
+            if (!Weak->HasUnreadMail())
+            {
+                Print(TEXT("Mail: no new letters"));
+                return;
+            }
+            TArray<FString> Ids;
+            for (const FNenLetter& Letter : Weak->Inbox)
+            {
+                const FString Items = FString::Join(Letter.Items, TEXT(", "));
+                Print(FString::Printf(TEXT("Mail: \"%s\"%s"), *Letter.Message,
+                                      Items.IsEmpty() ? TEXT("") : *(TEXT("  + ") + Items)));
+                Ids.Add(Letter.Id);
+            }
+            Weak->MarkLettersRead(Ids);
+        });
     }
 
     static void PrintInviteCode(const FString& Code)
@@ -556,10 +670,7 @@ namespace NenConsole
             }
             WithBackend(World, [Message](UNenBackendSubsystem* Backend)
             {
-                TSharedRef<FJsonObject> Body = MakeShared<FJsonObject>();
-                Body->SetStringField(TEXT("p_message"), Message);
-                Body->SetArrayField(TEXT("p_items"), TArray<TSharedPtr<FJsonValue>>());
-                Backend->CallRpc(TEXT("send_pigeon"), ToJson(Body), [Message](bool bOk, const FString& Json)
+                Backend->SendPigeon(Message, TArray<FString>(), [Message](bool bOk, const FString& Json)
                 {
                     ReportRpc(bOk, Json, FString::Printf(TEXT("Pigeon sent: \"%s\""), *Message));
                 });

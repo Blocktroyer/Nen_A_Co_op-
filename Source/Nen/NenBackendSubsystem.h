@@ -20,6 +20,18 @@ public:
 
 DECLARE_DYNAMIC_DELEGATE_TwoParams(FOnNenBackendResult, bool, bSuccess, const FString&, Json);
 DECLARE_DYNAMIC_DELEGATE_OneParam(FOnNenBackendDone, bool, bSuccess);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnNenInboxChanged);
+
+// One pigeon delivery (a row of the `mailbox` table)
+USTRUCT(BlueprintType)
+struct FNenLetter
+{
+	GENERATED_BODY()
+	UPROPERTY(BlueprintReadOnly, Category = "Nen|Mail") FString Id;
+	UPROPERTY(BlueprintReadOnly, Category = "Nen|Mail") FString Message;
+	UPROPERTY(BlueprintReadOnly, Category = "Nen|Mail") TArray<FString> Items;
+	UPROPERTY(BlueprintReadOnly, Category = "Nen|Mail") FDateTime SentAt;   // UTC
+};
 
 UCLASS(Config = Game)
 class NEN_API UNenBackendSubsystem : public UGameInstanceSubsystem
@@ -83,6 +95,35 @@ public:
 
 	// Upload World and acknowledge the events that changed it, in one call (save_world RPC)
 	void SaveWorld(const TArray<FString>& AppliedEventIds, TFunction<void(bool)> Done);
+
+	// ---- Mail (pigeon deliveries) ----
+
+	// Letters that have arrived and haven't been read yet, oldest first
+	UPROPERTY(BlueprintReadOnly, Category = "Nen|Mail")
+	TArray<FNenLetter> Inbox;
+
+	// Fires whenever Inbox changes: fetched, or letters marked read
+	UPROPERTY(BlueprintAssignable, Category = "Nen|Mail")
+	FOnNenInboxChanged OnInboxChanged;
+
+	// Replace Inbox with the unread letters on the server (signs in first if needed)
+	void FetchMail(TFunction<void(bool)> Done);
+
+	UFUNCTION(BlueprintCallable, Category = "Nen|Mail")
+	void FetchMailBP(FOnNenBackendDone OnDone);
+
+	// Send the partner a letter. Done gets the raw response (Supabase's error body on failure).
+	void SendPigeon(const FString& Message, const TArray<FString>& Items, TFunction<void(bool, const FString&)> Done);
+
+	UFUNCTION(BlueprintCallable, Category = "Nen|Mail")
+	void SendPigeonBP(const FString& Message, const TArray<FString>& Items, FOnNenBackendDone OnDone);
+
+	// Remove letters from Inbox right away and mark them read on the server
+	UFUNCTION(BlueprintCallable, Category = "Nen|Mail")
+	void MarkLettersRead(const TArray<FString>& LetterIds);
+
+	UFUNCTION(BlueprintPure, Category = "Nen|Mail")
+	bool HasUnreadMail() const { return Inbox.Num() > 0; }
 
 private:
 	// Applies one world_events row to World. Returns false for unknown types,
