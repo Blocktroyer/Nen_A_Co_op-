@@ -28,9 +28,17 @@ struct FNenLetter
 {
 	GENERATED_BODY()
 	UPROPERTY(BlueprintReadOnly, Category = "Nen|Mail") FString Id;
-	UPROPERTY(BlueprintReadOnly, Category = "Nen|Mail") FString Message;
+	// The three boxes of the letter: "Dear {To}", "{Body}", "From {From}".
+	// From is also the sender name shown in the mail list.
+	UPROPERTY(BlueprintReadOnly, Category = "Nen|Mail") FString To;
+	UPROPERTY(BlueprintReadOnly, Category = "Nen|Mail") FString Body;
+	UPROPERTY(BlueprintReadOnly, Category = "Nen|Mail") FString From;
 	UPROPERTY(BlueprintReadOnly, Category = "Nen|Mail") TArray<FString> Items;
 	UPROPERTY(BlueprintReadOnly, Category = "Nen|Mail") FDateTime SentAt;   // UTC
+	// True for letters I wrote, false for letters my partner sent me
+	UPROPERTY(BlueprintReadOnly, Category = "Nen|Mail") bool bSentByMe = false;
+	// Received letters: I've opened it (no unread icon). Sent letters: my partner has opened it.
+	UPROPERTY(BlueprintReadOnly, Category = "Nen|Mail") bool bRead = false;
 };
 
 UCLASS(Config = Game)
@@ -98,37 +106,59 @@ public:
 
 	// ---- Mail (pigeon deliveries) ----
 
-	// Letters that have arrived and haven't been read yet, oldest first
+	// Every letter, sent and received, newest first (bSentByMe tells them apart).
+	// Reading a letter keeps it here (bRead turns true); throwing it away moves it to Trash.
 	UPROPERTY(BlueprintReadOnly, Category = "Nen|Mail")
 	TArray<FNenLetter> Inbox;
 
-	// Fires whenever Inbox changes: fetched, or letters marked read
+	UPROPERTY(BlueprintReadOnly, Category = "Nen|Mail")
+	TArray<FNenLetter> Trash;
+
+	// Fires whenever Inbox or Trash changes: fetched, sent, read, trashed or restored
 	UPROPERTY(BlueprintAssignable, Category = "Nen|Mail")
 	FOnNenInboxChanged OnInboxChanged;
 
-	// Replace Inbox with the unread letters on the server (signs in first if needed)
+	// Reload Inbox and Trash from the server (signs in first if needed)
 	void FetchMail(TFunction<void(bool)> Done);
 
 	UFUNCTION(BlueprintCallable, Category = "Nen|Mail")
 	void FetchMailBP(FOnNenBackendDone OnDone);
 
-	// Send the partner a letter. Done gets the raw response (Supabase's error body on failure).
-	void SendPigeon(const FString& Message, const TArray<FString>& Items, TFunction<void(bool, const FString&)> Done);
+	// Send the partner a letter; it's added to the top of Inbox when the server accepts it.
+	// Done gets the raw response (Supabase's error body on failure).
+	void SendPigeon(const FString& To, const FString& Body, const FString& From, const TArray<FString>& Items,
+					TFunction<void(bool, const FString&)> Done);
 
 	UFUNCTION(BlueprintCallable, Category = "Nen|Mail")
-	void SendPigeonBP(const FString& Message, const TArray<FString>& Items, FOnNenBackendDone OnDone);
+	void SendPigeonBP(const FString& To, const FString& Body, const FString& From, const TArray<FString>& Items,
+					  FOnNenBackendDone OnDone);
 
-	// Remove letters from Inbox right away and mark them read on the server
+	// Clear the unread icon on received letters (Inbox or Trash), here and on the server
 	UFUNCTION(BlueprintCallable, Category = "Nen|Mail")
 	void MarkLettersRead(const TArray<FString>& LetterIds);
 
+	// Move letters (sent or received) from Inbox to Trash. Only hides them for me, not my partner.
+	UFUNCTION(BlueprintCallable, Category = "Nen|Mail")
+	void TrashLetters(const TArray<FString>& LetterIds);
+
+	// Move letters from Trash back to Inbox
+	UFUNCTION(BlueprintCallable, Category = "Nen|Mail")
+	void RestoreLetters(const TArray<FString>& LetterIds);
+
+	// Any unread received letter in Inbox (thrown-away letters don't raise the mailbox flag)
 	UFUNCTION(BlueprintPure, Category = "Nen|Mail")
-	bool HasUnreadMail() const { return Inbox.Num() > 0; }
+	bool HasUnreadMail() const { return GetUnreadCount() > 0; }
+
+	UFUNCTION(BlueprintPure, Category = "Nen|Mail")
+	int32 GetUnreadCount() const;
 
 private:
 	// Applies one world_events row to World. Returns false for unknown types,
 	// which stay unapplied so a newer build can handle them.
 	bool ApplyWorldEvent(const TSharedPtr<FJsonObject>& Event);
+
+	// Moves letters between Inbox and Trash locally, then calls set_mail_trashed
+	void SetLettersTrashed(const TArray<FString>& LetterIds, bool bTrashed);
 
 	UPROPERTY(Config) FString ProjectUrl;
 	UPROPERTY(Config) FString PublishableKey;

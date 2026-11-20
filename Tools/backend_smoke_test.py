@@ -124,7 +124,34 @@ def main():
         check("C cannot mark B's mail as read", len(still) == 1, f'{still}')
         rpc('mark_mail_collected', {'p_ids': [mail[0]['id']]}, b_tok)
         status, after = call('GET', mail_q, token=b_tok)
-        check('B marks it read, inbox empties', status == 200 and after == [], f'HTTP {status} {after}')
+        check('B marks it read, no unread mail left', status == 200 and after == [], f'HTTP {status} {after}')
+
+        # --- read mail stays; sent mail and trash (Tools/sql/mail_read_and_trash.sql)
+        letter_id = mail[0]['id']
+        one_q = f'/rest/v1/mailbox?select=id,collected_at,trashed_at,sender_trashed_at&id=eq.{letter_id}'
+        status, rows = call('GET', one_q, token=b_tok)
+        check('the read letter is still in B\'s mailbox', status == 200 and len(rows) == 1
+              and rows[0]['collected_at'] is not None, f'HTTP {status} {rows}')
+        status, rows = call('GET', f'/rest/v1/mailbox?select=id&sender=eq.{a_id}', token=a_tok)
+        check('A still sees the letter they sent', status == 200 and [r['id'] for r in rows] == [letter_id],
+              f'HTTP {status} {rows}')
+        rpc('set_mail_trashed', {'p_ids': [letter_id], 'p_trashed': True}, a_tok)
+        status, rows = call('GET', one_q, token=b_tok)
+        check("A trashes their copy without touching B's", status == 200 and rows
+              and rows[0].get('sender_trashed_at') is not None and rows[0].get('trashed_at') is None,
+              f'HTTP {status} {rows}')
+        rpc('set_mail_trashed', {'p_ids': [letter_id], 'p_trashed': True}, c_tok)
+        status, rows = call('GET', one_q, token=b_tok)
+        check("C cannot trash B's letter", status == 200 and rows and rows[0].get('trashed_at') is None,
+              f'HTTP {status} {rows}')
+        status, res = rpc('set_mail_trashed', {'p_ids': [letter_id], 'p_trashed': True}, b_tok)
+        status2, rows = call('GET', one_q, token=b_tok)
+        check('B throws it away', status in (200, 204) and rows and rows[0].get('trashed_at') is not None,
+              f'HTTP {status} {res} / {rows}')
+        rpc('set_mail_trashed', {'p_ids': [letter_id], 'p_trashed': False}, b_tok)
+        status, rows = call('GET', one_q, token=b_tok)
+        check('B restores it from the trash', status == 200 and rows and rows[0].get('trashed_at') is None,
+              f'HTTP {status} {rows}')
 
     # --- world events (storms stack)
     for _ in range(2):
@@ -152,6 +179,8 @@ def main():
     passed = sum(results)
     print(f'\n{passed}/{len(results)} checks passed')
     print(f'Test players: A={a_id}  B={b_id}  C={c_id}')
+    if passed < len(results):
+        print('Trash checks failing? Run Tools/sql/mail_read_and_trash.sql in the Supabase SQL editor.')
     sys.exit(0 if passed == len(results) else 1)
 
 
