@@ -25,6 +25,7 @@ public class Nen : ModuleRules
 
 		PublicIncludePaths.AddRange(new string[] {
 			"Nen",
+			"Nen/Hike",
 			"Nen/Variant_Platforming",
 			"Nen/Variant_Platforming/Animation",
 			"Nen/Variant_Combat",
