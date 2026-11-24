@@ -49,6 +49,15 @@ void UNenBackendSubsystem::Initialize(FSubsystemCollectionBase& Collection)
     }
 }
 
+void UNenBackendSubsystem::Deinitialize()
+{
+    // Requests still in flight see this and drop their replies (see Send)
+    bShutDown = true;
+    LoginWaiters.Reset();
+    OnInboxChanged.Clear();
+    Super::Deinitialize();
+}
+
 void UNenBackendSubsystem::Login(TFunction<void(bool)> Done)
 {
     const bool bResume = !RefreshToken.IsEmpty();
@@ -409,9 +418,16 @@ void UNenBackendSubsystem::Send(const FString& Verb, const FString& Url, const F
     {
         Req->SetContentAsString(Body);
     }
+    // Replies can arrive after play stops and this subsystem is gone. Every callback in this
+    // file touches the subsystem, so drop the reply instead of running them on freed memory.
+    TWeakObjectPtr<UNenBackendSubsystem> WeakThis(this);
     Req->OnProcessRequestComplete().BindLambda(
-        [Done](FHttpRequestPtr, FHttpResponsePtr Res, bool bConnected)
+        [WeakThis, Done](FHttpRequestPtr, FHttpResponsePtr Res, bool bConnected)
         {
+            if (!WeakThis.IsValid() || WeakThis->bShutDown)
+            {
+                return;
+            }
             const bool bOk = bConnected && Res.IsValid()
                           && EHttpResponseCodes::IsOk(Res->GetResponseCode());
             Done(bOk, Res.IsValid() ? Res->GetContentAsString() : FString());

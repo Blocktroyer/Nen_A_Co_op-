@@ -2,6 +2,7 @@
 
 #include "HikePlayerController.h"
 #include "HikeCharacter.h"
+#include "NenInteractableComponent.h"
 #include "EnhancedInputComponent.h"
 #include "Camera/PlayerCameraManager.h"
 #include "InputActionValue.h"
@@ -44,6 +45,48 @@ void AHikePlayerController::SetupInputComponent()
 		Input->BindAction(RunAction, ETriggerEvent::Completed, this, &AHikePlayerController::HandleRunReleased);
 		Input->BindAction(RunAction, ETriggerEvent::Canceled, this, &AHikePlayerController::HandleRunReleased);
 	}
+	if (InteractAction)
+	{
+		Input->BindAction(InteractAction, ETriggerEvent::Started, this, &AHikePlayerController::Interact);
+	}
+}
+
+void AHikePlayerController::Interact()
+{
+	if (UNenInteractableComponent* Interactable = GetBestInteractable())
+	{
+		Interactable->Interact(GetPawn());
+	}
+}
+
+UNenInteractableComponent* AHikePlayerController::GetBestInteractable() const
+{
+	APawn* ControlledPawn = GetPawn();
+	if (!ControlledPawn)
+	{
+		return nullptr;
+	}
+
+	TArray<UPrimitiveComponent*> Overlapping;
+	ControlledPawn->GetOverlappingComponents(Overlapping);
+
+	UNenInteractableComponent* Best = nullptr;
+	float BestDistanceSq = TNumericLimits<float>::Max();
+	for (UPrimitiveComponent* Component : Overlapping)
+	{
+		UNenInteractableComponent* Interactable = Cast<UNenInteractableComponent>(Component);
+		if (!Interactable || !Interactable->bEnabled)
+		{
+			continue;
+		}
+		const float DistanceSq = FVector::DistSquared(Interactable->GetComponentLocation(), ControlledPawn->GetActorLocation());
+		if (DistanceSq < BestDistanceSq)
+		{
+			Best = Interactable;
+			BestDistanceSq = DistanceSq;
+		}
+	}
+	return Best;
 }
 
 void AHikePlayerController::OnUnPossess()

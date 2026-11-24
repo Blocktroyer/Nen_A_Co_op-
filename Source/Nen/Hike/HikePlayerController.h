@@ -7,17 +7,28 @@
 #include "HikePlayerController.generated.h"
 
 class UInputAction;
+class UNenInteractableComponent;
 struct FInputActionValue;
 
 /**
  *  Turns player input into intent for an AHikeCharacter:
- *  camera-relative movement, look, jump (press/hold) and run.
+ *  camera-relative movement, look, jump (press/hold), run and interact.
  *  Mapping contexts are added by the parent ANenPlayerController.
  */
 UCLASS()
 class NEN_API AHikePlayerController : public ANenPlayerController
 {
 	GENERATED_BODY()
+
+public:
+
+	/** Uses the nearest interactable (mailbox etc.) the pawn is standing in range of */
+	UFUNCTION(BlueprintCallable, Category="Input")
+	void Interact();
+
+	/** Nearest enabled interactable overlapping the pawn, or null. Use it to show the prompt. */
+	UFUNCTION(BlueprintPure, Category="Interaction")
+	UNenInteractableComponent* GetBestInteractable() const;
 
 protected:
 
@@ -35,6 +46,9 @@ protected:
 
 	UPROPERTY(EditAnywhere, Category="Input|Actions")
 	UInputAction* RunAction;
+
+	UPROPERTY(EditAnywhere, Category="Input|Actions")
+	UInputAction* InteractAction;
 
 	/** Tap run to toggle instead of holding it */
 	UPROPERTY(EditAnywhere, Category="Input|Options")

@@ -47,6 +47,7 @@ class NEN_API UNenBackendSubsystem : public UGameInstanceSubsystem
 	GENERATED_BODY()
 public:
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
+	virtual void Deinitialize() override;
 
 	// First launch: anonymous sign-up. Later launches: resume the saved session.
 	void Login(TFunction<void(bool)> Done);
@@ -168,6 +169,7 @@ private:
 	FString UserId;
 
 	FString AuthSlot = TEXT("NenAuth");
+	bool bShutDown = false;   // set in Deinitialize; late HTTP replies are ignored after this
 	TArray<TFunction<void(bool)>> LoginWaiters;
 
 	void Send(const FString& Verb, const FString& Url, const FString& Body, bool bWithUser,
