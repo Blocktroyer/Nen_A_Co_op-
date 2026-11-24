@@ -11,6 +11,7 @@
 #include "EnhancedInputSubsystems.h"
 #include "InputActionValue.h"
 #include "Nen.h"
+#include "NenInteractableComponent.h"
 
 ANenCharacter::ANenCharacter()
 {
@@ -65,6 +66,12 @@ void ANenCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCompon
 
 		// Looking
 		EnhancedInputComponent->BindAction(LookAction, ETriggerEvent::Triggered, this, &ANenCharacter::Look);
+
+		// Interacting
+		if (InteractAction)
+		{
+			EnhancedInputComponent->BindAction(InteractAction, ETriggerEvent::Started, this, &ANenCharacter::DoInteract);
+		}
 	}
 	else
 	{
@@ -130,4 +137,36 @@ void ANenCharacter::DoJumpEnd()
 {
 	// signal the character to stop jumping
 	StopJumping();
+}
+
+void ANenCharacter::DoInteract()
+{
+	if (UNenInteractableComponent* Interactable = GetBestInteractable())
+	{
+		Interactable->Interact(this);
+	}
+}
+
+UNenInteractableComponent* ANenCharacter::GetBestInteractable() const
+{
+	TArray<UPrimitiveComponent*> Overlapping;
+	GetOverlappingComponents(Overlapping);
+
+	UNenInteractableComponent* Best = nullptr;
+	float BestDistanceSq = TNumericLimits<float>::Max();
+	for (UPrimitiveComponent* Component : Overlapping)
+	{
+		UNenInteractableComponent* Interactable = Cast<UNenInteractableComponent>(Component);
+		if (!Interactable || !Interactable->bEnabled)
+		{
+			continue;
+		}
+		const float DistanceSq = FVector::DistSquared(Interactable->GetComponentLocation(), GetActorLocation());
+		if (DistanceSq < BestDistanceSq)
+		{
+			Best = Interactable;
+			BestDistanceSq = DistanceSq;
+		}
+	}
+	return Best;
 }
